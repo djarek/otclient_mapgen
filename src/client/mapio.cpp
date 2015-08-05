@@ -19,7 +19,7 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
-
+#include <boost/lockfree/spsc_queue.hpp>
 #include "map.h"
 #include "tile.h"
 #include "game.h"
@@ -61,8 +61,122 @@ void mapPartGenerator(int threadId, int minx, int miny, int minz, int maxx, int 
     threadsStates[threadId] = false;
 }
 
+class MapGenWorkItem
+{
+public:
+    static MapGenWorkItem* make(int minx, int miny, int minz, int maxx, int maxy, int maxz) {
+        return new MapGenWorkItem(minx, miny, minz, maxx, maxy, maxz);
+    }
+
+    void execute() {
+        mapPartGenerator(0, minx, miny, minz, maxx, maxy, maxz);
+    }
+
+private:
+    int minx, miny, minz, maxx, maxy, maxz;
+    bool lastItem;
+    MapGenWorkItem(int minx, int miny, int minz, int maxx, int maxy, int maxz):
+        minx(minx),
+        miny(miny),
+        minz(minz),
+        maxx(maxx),
+        maxy(maxy),
+        maxz(maxz) {}
+};
+class Monitor {
+public:
+	void wait() {
+		std::unique_lock<std::mutex> lock {mtx};
+		cv.wait(lock);
+	}
+	
+	void notify() {
+		cv.notify_one();
+	}
+private:
+	std::mutex mtx;
+	std::condition_variable cv;
+};
+
+template <typename WorkItemType>
+class WorkQueue
+{
+public:
+    WorkQueue(int workerCount):
+        workerCount(workerCount),
+        workers(new Worker[workerCount]) {}
+    
+    ~WorkQueue() {
+        signalCompletion();
+    }
+    
+    bool tryPush(WorkItemType* workItem) {
+        lastWorkerPushed = (lastWorkerPushed + 1) % workerCount;
+        auto ret = workers[lastWorkerPushed].workQueue.push(workItem);
+		workers[lastWorkerPushed].notify();
+		return ret;
+    }
+    
+    void signalCompletion() {
+        if (workers) {
+            for(int i = 0; i < workerCount; ++i) {
+                while(workers[i].workQueue.push(nullptr));
+				workers[i].notify();
+            }
+            joinAll();
+        }
+    }
+    
+    void joinAll() {
+        workers.reset();
+    }
+private:
+    struct WorkItemHolder {
+        WorkItemHolder() = default;
+        WorkItemHolder(const WorkItemHolder&) = delete;
+        WorkItemHolder& operator=(const WorkItemHolder&) = delete;
+        ~WorkItemHolder() {
+            delete ptr;
+        }
+        WorkItemType* ptr {nullptr};
+    };
+    struct Worker : Monitor
+    {
+        Worker():
+            thread(&Worker::workerLoop, this) {}
+
+        void workerLoop() {
+            while(true) {
+                WorkItemHolder work;
+                if(workQueue.pop(work.ptr)) {
+                    if(work.ptr == nullptr) {
+                        return;
+                    } else {
+                        work.ptr->execute();
+                    }
+                } else {
+                    wait();
+                }
+            }
+        }
+        ~Worker() {
+            if(thread.joinable()) {
+                thread.join();
+            }
+        }
+        boost::lockfree::spsc_queue<WorkItemType*> workQueue {maxItemsPerWorker};
+        std::thread thread;
+        static constexpr auto maxItemsPerWorker = 100;
+    };
+
+    int workerCount;
+    std::unique_ptr<Worker[]> workers;
+    int lastWorkerPushed {0};
+};
+
 void Map::initializeMapGenerator()
 {
+    //WorkQueue<MapGenWorkItem> queue (10);
     isRunning = true;
     for(int i = 0; i < THREADS_NUMBER; i++)
     {
@@ -72,13 +186,15 @@ void Map::initializeMapGenerator()
 
 bool Map::isThreadRunning(int threadId)
 {
-    return threadsStates[threadId];
+    return false;
 }
 
 void Map::startThread(int threadId, int minx, int miny, int minz, int maxx, int maxy, int maxz)
 {
-    threadsStates[threadId] = true;
-    threads[threadId] = new boost::thread(mapPartGenerator, threadId, minx, miny, minz, maxx, maxy, maxz);
+    static WorkQueue<MapGenWorkItem> queue (64);
+    /*threadsStates[threadId] = true;
+    threads[threadId] = new boost::thread(mapPartGenerator, threadId, minx, miny, minz, maxx, maxy, maxz);*/
+    while (!queue.tryPush(MapGenWorkItem::make(minx, miny, minz, maxx, maxy, maxz)));
 }
 
 void Map::drawMap(std::string fileName, int sx, int sy, int sz, int size)
