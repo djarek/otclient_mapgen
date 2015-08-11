@@ -33,12 +33,7 @@
 #include <framework/ui/uiwidget.h>
 #include <framework/graphics/image.h>
 
-#define THREADS_NUMBER 128
-boost::thread* threads[THREADS_NUMBER];
-bool threadsStates[THREADS_NUMBER];
-bool isRunning = false;
-
-void mapPartGenerator(int threadId, int minx, int miny, int minz, int maxx, int maxy, int maxz)
+void mapPartGenerator(int minx, int miny, int minz, int maxx, int maxy, int maxz)
 {
     for(int z = minz; z <= maxz; z++)
     {
@@ -53,12 +48,12 @@ void mapPartGenerator(int threadId, int minx, int miny, int minz, int maxx, int 
             for(int y = miny; y <= maxy; y++)
             {
                 std::stringstream path3;
-                path3 << "map/" << z << "/" << x << "/" << z << "_" << x << "_" << y << ".png";
+                path3 << "map/"<< x << "_" << y << "_" << z << ".png";
+                //path3 << "map/" << z << "/" << x << "/" << z << "_" << x << "_" << y << ".png";
                 g_map.drawMap(path3.str(), x * 8, y * 8, z, 8);
             }
         }
     }
-    threadsStates[threadId] = false;
 }
 
 class MapGenWorkItem
@@ -69,12 +64,11 @@ public:
     }
 
     void execute() {
-        mapPartGenerator(0, minx, miny, minz, maxx, maxy, maxz);
+        mapPartGenerator(minx, miny, minz, maxx, maxy, maxz);
     }
 
 private:
     int minx, miny, minz, maxx, maxy, maxz;
-    bool lastItem;
     MapGenWorkItem(int minx, int miny, int minz, int maxx, int maxy, int maxz):
         minx(minx),
         miny(miny),
@@ -83,6 +77,7 @@ private:
         maxy(maxy),
         maxz(maxz) {}
 };
+
 class Monitor {
 public:
 	void wait() {
@@ -110,18 +105,35 @@ public:
         signalCompletion();
     }
     
+    bool start(int workerCount) {
+        if (!workers) {
+            this->workerCount = workerCount;
+            lastWorkerPushed = 0;
+            workers.reset(new Worker[workerCount]);
+            return true;
+        } else {
+            return false;
+        }
+    }
+    
+    bool completed() const {
+        return workers;
+    }
+    
     bool tryPush(WorkItemType* workItem) {
-        lastWorkerPushed = (lastWorkerPushed + 1) % workerCount;
+        lastWorkerPushed = (lastWorkerPushed + 1) % workerCount; //Round-Robin work scheduling
         auto ret = workers[lastWorkerPushed].workQueue.push(workItem);
-		workers[lastWorkerPushed].notify();
-		return ret;
+        if (ret) {
+            workers[lastWorkerPushed].notify();
+        }
+        return ret;
     }
     
     void signalCompletion() {
         if (workers) {
             for(int i = 0; i < workerCount; ++i) {
                 while(workers[i].workQueue.push(nullptr));
-				workers[i].notify();
+                workers[i].notify();
             }
             joinAll();
         }
@@ -140,9 +152,12 @@ private:
         }
         WorkItemType* ptr {nullptr};
     };
+
     struct Worker : Monitor
     {
+        typedef boost::lockfree::spsc_queue<WorkItemType*> WorkItemQueue;
         Worker():
+            workQueue(maxItemsPerWorker),
             thread(&Worker::workerLoop, this) {}
 
         void workerLoop() {
@@ -159,14 +174,16 @@ private:
                 }
             }
         }
+
         ~Worker() {
             if(thread.joinable()) {
                 thread.join();
             }
         }
-        boost::lockfree::spsc_queue<WorkItemType*> workQueue {maxItemsPerWorker};
+        
+        WorkItemQueue workQueue;
         std::thread thread;
-        static constexpr auto maxItemsPerWorker = 100;
+        static constexpr auto maxItemsPerWorker = 1000;
     };
 
     int workerCount;
@@ -174,14 +191,9 @@ private:
     int lastWorkerPushed {0};
 };
 
+WorkQueue<MapGenWorkItem> queue (16);
 void Map::initializeMapGenerator()
 {
-    //WorkQueue<MapGenWorkItem> queue (10);
-    isRunning = true;
-    for(int i = 0; i < THREADS_NUMBER; i++)
-    {
-        threadsStates[i] = false;
-    }
 }
 
 bool Map::isThreadRunning(int threadId)
@@ -191,7 +203,6 @@ bool Map::isThreadRunning(int threadId)
 
 void Map::startThread(int threadId, int minx, int miny, int minz, int maxx, int maxy, int maxz)
 {
-    static WorkQueue<MapGenWorkItem> queue (64);
     /*threadsStates[threadId] = true;
     threads[threadId] = new boost::thread(mapPartGenerator, threadId, minx, miny, minz, maxx, maxy, maxz);*/
     while (!queue.tryPush(MapGenWorkItem::make(minx, miny, minz, maxx, maxy, maxz)));
@@ -225,9 +236,9 @@ void Map::drawMap(std::string fileName, int sx, int sy, int sz, int size)
             }
         }
 
-		// reduce image size to size from argument (for generation time image is 2 tiles bigger, because of 64x64 items)
+        // reduce image size to size from argument (for generation time image is 2 tiles bigger, because of 64x64 items)
         image->cut();
-		// save to file, save function is modified and will ignore empty images!
+        // save to file, save function is modified and will ignore empty images!
         image->savePNG(fileName);
 }
 
