@@ -84,7 +84,7 @@ public:
 		std::unique_lock<std::mutex> lock {mtx};
 		cv.wait(lock);
 	}
-	
+
 	void notify() {
 		cv.notify_one();
 	}
@@ -97,50 +97,49 @@ template <typename WorkItemType>
 class WorkQueue
 {
 public:
-    WorkQueue(int workerCount):
-        workerCount(workerCount),
-        workers(new Worker[workerCount]) {}
-    
     ~WorkQueue() {
         signalCompletion();
     }
-    
-    bool start(int workerCount) {
-        if (!workers) {
-            this->workerCount = workerCount;
+
+    bool start(int workerCount, int itemsPerWorker) {
+        if (workers.empty()) {
             lastWorkerPushed = 0;
-            workers.reset(new Worker[workerCount]);
+            for (int i = 0; i < workerCount; ++i) {
+                workers.emplace_back(new Worker(itemsPerWorker, *this));
+            }
             return true;
         } else {
             return false;
         }
     }
-    
-    bool completed() const {
-        return workers;
+
+    int64_t getCompletedCount() const {
+        return completedWorkItems.load(std::memory_order_relaxed);
     }
-    
+
+    bool completed() const {
+        return workers.empty();
+    }
+
     bool tryPush(WorkItemType* workItem) {
-        lastWorkerPushed = (lastWorkerPushed + 1) % workerCount; //Round-Robin work scheduling
-        auto ret = workers[lastWorkerPushed].workQueue.push(workItem);
+        lastWorkerPushed = (lastWorkerPushed + 1) % workers.size(); //Round-Robin work scheduling
+        auto ret = workers[lastWorkerPushed]->workItemQueue.push(workItem);
         if (ret) {
-            workers[lastWorkerPushed].notify();
+            workers[lastWorkerPushed]->notify();
         }
         return ret;
     }
-    
+
     void signalCompletion() {
-        if (workers) {
-            for(int i = 0; i < workerCount; ++i) {
-                while(workers[i].workQueue.push(nullptr));
-                workers[i].notify();
-            }
-            joinAll();
+        for(const auto& worker : workers) {
+            while(worker->workItemQueue.push(nullptr));
+            worker->notify();
         }
+        joinAll();
     }
-    
+
     void joinAll() {
-        workers.reset();
+        workers.clear();
     }
 private:
     struct WorkItemHolder {
@@ -156,18 +155,20 @@ private:
     struct Worker : Monitor
     {
         typedef boost::lockfree::spsc_queue<WorkItemType*> WorkItemQueue;
-        Worker():
-            workQueue(maxItemsPerWorker),
+        Worker(int maxItemsPerWorker, WorkQueue& queue):
+            queue(queue),
+            workItemQueue(maxItemsPerWorker),
             thread(&Worker::workerLoop, this) {}
 
         void workerLoop() {
             while(true) {
                 WorkItemHolder work;
-                if(workQueue.pop(work.ptr)) {
+                if(workItemQueue.pop(work.ptr)) {
                     if(work.ptr == nullptr) {
                         return;
                     } else {
                         work.ptr->execute();
+                        queue.completedWorkItems.fetch_add(1, std::memory_order_relaxed);
                     }
                 } else {
                     wait();
@@ -180,20 +181,21 @@ private:
                 thread.join();
             }
         }
-        
-        WorkItemQueue workQueue;
+
+        WorkQueue& queue;
+        WorkItemQueue workItemQueue;
         std::thread thread;
-        static constexpr auto maxItemsPerWorker = 1000;
     };
 
-    int workerCount;
-    std::unique_ptr<Worker[]> workers;
+    std::vector<std::unique_ptr<Worker>> workers;
     int lastWorkerPushed {0};
+    std::atomic<int64_t> completedWorkItems {0};
 };
 
-WorkQueue<MapGenWorkItem> queue (16);
+WorkQueue<MapGenWorkItem> queue;
 void Map::initializeMapGenerator()
 {
+    queue.start(16, 1000);
 }
 
 bool Map::isThreadRunning(int threadId)
